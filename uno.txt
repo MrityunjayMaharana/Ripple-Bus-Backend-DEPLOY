@@ -1,0 +1,836 @@
+/**
+ * Smart Bus IoT Node - ESP32-WROOM-32 Firmware v5.2
+ * Uses MPU6050_light by rfetick
+ *
+ * LIBRARY TO INSTALL:
+ *   Tools → Manage Libraries → search "MPU6050_light"
+ *   Install: "MPU6050_light" by rfetick
+ *
+ * ALL LIBRARIES NEEDED:
+ *   ✅ MPU6050_light        by rfetick
+ *   ✅ ArduinoJson          by Benoit Blanchon
+ *   ✅ TinyGPS++            by Mikal Hart
+ *   ✅ WebSockets           by Markus Sattler
+ *   ✅ DHT sensor library   by Adafruit
+ *   ✅ Adafruit Unified Sensor by Adafruit
+ *   ✅ Adafruit SSD1306     by Adafruit
+ *   ✅ Adafruit GFX Library by Adafruit
+ *
+ * YOUR EXACT WIRING:
+ * ┌──────────────────────────────────────────┐
+ * │  NEO-6M GPS                              │
+ * │    VCC  → 3.3V   GND → GND              │
+ * │    TX   → GPIO16   RX → GPIO17           │
+ * ├──────────────────────────────────────────┤
+ * │  MPU6050                                 │
+ * │    VCC  → 3.3V   GND → GND              │
+ * │    SDA  → GPIO21   SCL → GPIO22          │
+ * │    AD0  → GND  (I2C address = 0x68)      │
+ * ├──────────────────────────────────────────┤
+ * │  DHT22 (3-pin module)                    │
+ * │    +    → 3.3V                           │
+ * │    OUT  → GPIO4                          │
+ * │    -    → GND                            │
+ * ├──────────────────────────────────────────┤
+ * │  IR Sensor (Option A — active)           │
+ * │    VCC  → 3.3V   GND → GND              │
+ * │    OUT  → GPIO15                         │
+ * ├──────────────────────────────────────────┤
+ * │  HC-SR04 Ultrasonic (Option B — better)  │
+ * │    VCC  → 5V     GND → GND              │
+ * │    TRIG → GPIO12                         │
+ * │    ECHO → GPIO14 (via voltage divider)   │
+ * │    ECHO→1kΩ→GPIO14, GPIO14→2kΩ→GND      │
+ * ├──────────────────────────────────────────┤
+ * │  SSD1306 OLED 128x64                     │
+ * │    VCC  → 3.3V   GND → GND              │
+ * │    SDA  → GPIO21   SCL → GPIO22          │
+ * └──────────────────────────────────────────┘
+ */
+
+#include <Wire.h>
+#include <WiFi.h>
+#include <WebSocketsClient.h>
+#include <ArduinoJson.h>
+#include <TinyGPS++.h>
+#include <DHT.h>
+#include <MPU6050_light.h>        // ← rfetick library
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_GFX.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+// ─────────────────────────────────────────────────────────────────────
+// ✏️  CHOOSE OBSTACLE SENSOR
+//     "IR"         → IR module digital OUT on GPIO15
+//     "ULTRASONIC" → HC-SR04 TRIG=GPIO12, ECHO=GPIO14
+// ─────────────────────────────────────────────────────────────────────
+#define OBSTACLE_SENSOR   "IR"
+
+// ─────────────────────────────────────────────────────────────────────
+// ✏️  YOUR CREDENTIALS — edit before uploading
+// ─────────────────────────────────────────────────────────────────────
+#define WIFI_SSID         "sonu"
+#define WIFI_PASSWORD     "87654321"
+#define SERVER_HOST       "10.203.133.139"   // run ipconfig to find your PC IP
+#define SERVER_PORT       4500 
+#define JWT_TOKEN         "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjY5YWFmMmMzNmRlNDVlMzUyMzIzZGFjNyIsImlhdCI6MTc3NTY1MjI0OSwiZXhwIjoxNzc2MjU3MDQ5fQ.hMIpTQzViWaQH4PEkbDMuilfwy-FuOz_7MWgCkH4cFk"
+#define BUS_ID            "69ab81d5ba4d132660c01991"     // MongoDB _id of the bus
+#define DEVICE_ROLE       "driver"          // "driver" or "conductor"
+#define CONDUCTOR_ROLE    "conductor"          // "driver" or "conductor"
+
+// ─────────────────────────────────────────────────────────────────────
+// PINS
+// ─────────────────────────────────────────────────────────────────────
+#define GPS_RX_PIN        16
+#define GPS_TX_PIN        17
+#define I2C_SDA           21
+#define I2C_SCL           22
+#define DHT_PIN           4
+#define DHT_TYPE          DHT22
+#define IR_PIN            15
+#define TRIG_PIN          12
+#define ECHO_PIN          14
+#define SS_PIN   5
+#define RST_PIN  25
+
+// ─────────────────────────────────────────────────────────────────────
+// OLED
+// ─────────────────────────────────────────────────────────────────────
+#define OLED_W            128
+#define OLED_H            64
+#define OLED_RESET        -1
+#define OLED_ADDR         0x3C    // Try 0x3D if screen stays blank
+
+// ─────────────────────────────────────────────────────────────────────
+// MPU6050_light — gives angles (pitch, roll) and raw accel/gyro
+// Rash driving thresholds in m/s² and °/s
+// ─────────────────────────────────────────────────────────────────────
+#define RASH_BRAKE_MS2     -6.0   // Harsh braking  (accelX negative)
+#define RASH_ACCEL_MS2      5.5   // Harsh accel    (accelX positive)
+#define RASH_TURN_MS2       6.0   // Sharp turn     (accelY abs)
+#define RASH_BUMP_MS2       7.0   // Bump/pothole   (accelZ net above gravity)
+#define RASH_GYRO_DEG       80.0  // Harsh rotation (gyroZ deg/s)
+
+// ─────────────────────────────────────────────────────────────────────
+// OBSTACLE THRESHOLDS
+// ─────────────────────────────────────────────────────────────────────
+#define IR_OBSTACLE_ACTIVE  LOW   // Most IR modules pull LOW on obstacle
+#define ULTRASONIC_WARN_CM  60.0  // Flag obstacle if closer than this
+
+// ─────────────────────────────────────────────────────────────────────
+// TIMING (ms)
+// ─────────────────────────────────────────────────────────────────────
+#define T_TELEMETRY       2000
+#define T_DHT             3000
+#define T_OLED            1000
+#define T_MPU             100    // MPU sampled every 100ms
+#define T_RECONNECT       5000
+
+// ─────────────────────────────────────────────────────────────────────
+// OBJECTS
+// ─────────────────────────────────────────────────────────────────────
+HardwareSerial      gpsSerial(2);
+TinyGPSPlus         gps;
+WebSocketsClient    wsClient;
+DHT                 dht(DHT_PIN, DHT_TYPE);
+MPU6050             mpu(Wire);                    // MPU6050_light object
+Adafruit_SSD1306    display(OLED_W, OLED_H, &Wire, OLED_RESET);
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+// ─────────────────────────────────────────────────────────────────────
+// RUNTIME STATE
+// ─────────────────────────────────────────────────────────────────────
+bool wsConnected = false;
+bool mpuReady    = false;
+bool oledReady   = false;
+
+unsigned long tTelemetry = 0;
+unsigned long tDHT       = 0;
+unsigned long tOLED      = 0;
+unsigned long tMPU       = 0;
+
+// GPS speed smoothing (5 sample rolling average)
+float speedBuf[5] = {0}; int speedIdx = 0;
+
+// DHT22 cache
+float cTemp = 0, cHum = 0, cHeatIdx = 0;
+bool  dhtValid = false;
+
+// MPU6050_light values
+// getAccX/Y/Z returns m/s²  (already converted by library)
+// getGyroX/Y/Z returns deg/s (already converted by library)
+float ax = 0, ay = 0, az = 0;
+float gx = 0, gy = 0, gz = 0;
+float pitch = 0, roll = 0;
+float aMag = 0;
+
+// Rash driving flags — cleared after each telemetry emit
+bool rashBrake = false;
+bool rashAccel = false;
+bool rashTurn  = false;
+bool rashBump  = false;
+
+// Obstacle state
+float obstDist     = 999.0;
+bool  obstDetected = false;
+
+// Safety score received from server (displayed on OLED)
+float  serverScore = -1;
+String serverBand  = "none";
+
+// OLED page cycling (4 pages × 3 seconds each)
+int oledPage = 0;
+int oledTick = 0;
+
+// ─────────────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────────────
+float smoothSpeed(float v) {
+  speedBuf[speedIdx] = v;
+  speedIdx = (speedIdx + 1) % 5;
+  float s = 0;
+  for (int i = 0; i < 5; i++) s += speedBuf[i];
+  return s / 5.0;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// DHT22
+// ─────────────────────────────────────────────────────────────────────
+void readDHT() {
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+  if (isnan(h) || isnan(t)) {
+    dhtValid = false;
+    Serial.println("DHT22: Read failed — check GPIO4");
+    return;
+  }
+  cTemp    = t;
+  cHum     = h;
+  cHeatIdx = dht.computeHeatIndex(t, h, false);
+  dhtValid = true;
+  Serial.printf("DHT22: %.1fC  %.1f%%  HI:%.1fC\n", t, h, cHeatIdx);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// MPU6050_light — sample and detect rash events
+// MPU6050_light already handles:
+//   - Calibration offset removal
+//   - Converting raw → m/s² and deg/s
+//   - Complementary filter for pitch/roll angles
+// ─────────────────────────────────────────────────────────────────────
+void sampleMPU() {
+  if (!mpuReady) return;
+
+  // Update internal filter — must call this regularly
+  mpu.update();
+
+  // Get linear acceleration in m/s²
+  ax = mpu.getAccX();
+  ay = mpu.getAccY();
+  az = mpu.getAccZ();
+
+  // Get rotation rate in deg/s
+  gx = mpu.getGyroX();
+  gy = mpu.getGyroY();
+  gz = mpu.getGyroZ();
+
+  // Get filtered tilt angles (complementary filter inside library)
+  pitch = mpu.getAngleX();
+  roll  = mpu.getAngleY();
+
+  // Total acceleration magnitude
+  aMag = sqrt(ax*ax + ay*ay + az*az);
+
+  // Net Z (remove gravity component ~9.81)
+  float azNet  = abs(az) - 9.81;
+  // Lateral + forward magnitude
+  float xyMag  = sqrt(ax*ax + ay*ay);
+
+  // ── Rash driving detection ───────────────────────────────────────
+  // Harsh braking: strong negative X axis (forward deceleration)
+  if (ax < RASH_BRAKE_MS2) {
+    rashBrake = true;
+    Serial.println("RASH: HARSH BRAKE");
+  }
+
+  // Harsh acceleration: strong positive X axis
+  if (ax > RASH_ACCEL_MS2) {
+    rashAccel = true;
+    Serial.println("RASH: HARSH ACCEL");
+  }
+
+  // Harsh turn: high lateral Y OR high gyro Z rotation rate
+  if (abs(ay) > RASH_TURN_MS2 || abs(gz) > RASH_GYRO_DEG) {
+    rashTurn = true;
+    Serial.println("RASH: SHARP TURN");
+  }
+
+  // Bump/pothole: Z spike well above gravity
+  if (azNet > RASH_BUMP_MS2) {
+    rashBump = true;
+    Serial.println("RASH: BUMP/POTHOLE");
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// OBSTACLE — IR sensor (Option A)
+// Digital read: LOW = obstacle present on most modules
+// ─────────────────────────────────────────────────────────────────────
+void readIR() {
+  // Take 5 readings over 50ms — require at least 4/5 to confirm obstacle
+  // This prevents false triggers from electrical noise
+  int detCount = 0;
+  for (int i = 0; i < 5; i++) {
+    if (digitalRead(IR_PIN) == IR_OBSTACLE_ACTIVE) detCount++;
+    delay(10);
+  }
+  obstDetected = (detCount >= 4);          // 4 of 5 readings must agree
+  obstDist     = obstDetected ? 20.0 : 999.0; // 999 = clear, no obstacle
+  Serial.printf("IR: %s (count=%d/5)\n", obstDetected ? "OBSTACLE" : "Clear", detCount);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// OBSTACLE — HC-SR04 ultrasonic (Option B)
+// ECHO pin must use voltage divider: 5V→1kΩ→GPIO14→2kΩ→GND
+// ─────────────────────────────────────────────────────────────────────
+void readUltrasonic() {
+  digitalWrite(TRIG_PIN, LOW);  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // 30ms timeout
+  if (duration == 0) {
+    obstDist     = 400.0;   // Out of range
+    obstDetected = false;
+  } else {
+    obstDist     = (duration * 0.0343) / 2.0;
+    obstDist     = constrain(obstDist, 2.0, 400.0);
+    obstDetected = (obstDist < ULTRASONIC_WARN_CM);
+  }
+  Serial.printf("HC-SR04: %.1fcm %s\n", obstDist, obstDetected ? "[!]" : "OK");
+}
+
+void readObstacle() {
+  if (String(OBSTACLE_SENSOR) == "ULTRASONIC") readUltrasonic();
+  else                                          readIR();
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// OLED — 4 pages, cycles every 3 seconds
+// Shows ALL raw metrics for hardware visualisation
+// ─────────────────────────────────────────────────────────────────────
+void updateOLED() {
+  if (!oledReady) return;
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  switch (oledPage) {
+
+    // ── PAGE 0: GPS ───────────────────────────────────────────────
+    case 0:
+      display.setCursor(35, 0);
+      display.println(F("=== GPS ==="));
+
+      display.setCursor(0, 11);
+      if (gps.location.isValid()) {
+        display.print(F("Lat: ")); display.println(gps.location.lat(), 5);
+        display.setCursor(0, 20);
+        display.print(F("Lng: ")); display.println(gps.location.lng(), 5);
+      } else {
+        display.println(F("Waiting for fix..."));
+      }
+
+      display.setCursor(0, 31);
+      display.print(F("Speed: "));
+      display.print(gps.speed.isValid() ? gps.speed.kmph() : 0.0, 1);
+      display.println(F(" km/h"));
+
+      display.setCursor(0, 41);
+      display.print(F("Sats: "));
+      display.print(gps.satellites.isValid() ? gps.satellites.value() : 0);
+      display.print(F("  HDOP: "));
+      display.println(gps.hdop.isValid() ? gps.hdop.hdop() : 0.0, 1);
+
+      display.setCursor(0, 52);
+      display.print(F("Hdg: "));
+      display.print(gps.course.isValid() ? (int)gps.course.deg() : 0);
+      display.println(F(" deg"));
+      break;
+
+    // ── PAGE 1: DHT22 + OBSTACLE ──────────────────────────────────
+    case 1:
+      display.setCursor(15, 0);
+      display.println(F("=== CABIN + SENSOR ==="));
+
+      display.setCursor(0, 11);
+      if (dhtValid) {
+        display.print(F("Temp:  ")); display.print(cTemp, 1);   display.println(F(" C"));
+        display.setCursor(0, 20);
+        display.print(F("Humid: ")); display.print(cHum, 1);    display.println(F(" %"));
+        display.setCursor(0, 30);
+        display.print(F("HeatI: ")); display.print(cHeatIdx, 1);display.println(F(" C"));
+      } else {
+        display.println(F("DHT22: No data!"));
+        display.setCursor(0, 20);
+        display.println(F("Check GPIO4 wiring"));
+      }
+
+      display.setCursor(0, 42);
+      if (String(OBSTACLE_SENSOR) == "ULTRASONIC") {
+        display.print(F("HC-SR04: "));
+        display.print(obstDist, 1); display.println(F(" cm"));
+      } else {
+        display.print(F("IR Sens: "));
+        display.println(obstDetected ? F("OBSTACLE!") : F("Clear"));
+      }
+
+      display.setCursor(0, 54);
+      display.print(F("Status: "));
+      display.println(obstDetected ? F("[!] DETECTED") : F("OK - Clear"));
+      break;
+
+    // ── PAGE 2: MPU6050 ───────────────────────────────────────────
+    case 2:
+      display.setCursor(22, 0);
+      display.println(F("=== MPU6050 ==="));
+
+      if (!mpuReady) {
+        display.setCursor(0, 18); display.println(F("NOT FOUND!"));
+        display.setCursor(0, 30); display.println(F("Check SDA=21 SCL=22"));
+        display.setCursor(0, 42); display.println(F("AD0 must be GND"));
+        break;
+      }
+
+      display.setCursor(0, 10);
+      display.print(F("Ax:")); display.print(ax, 2);
+      display.print(F(" Ay:")); display.println(ay, 2);
+
+      display.setCursor(0, 19);
+      display.print(F("Az:")); display.print(az, 2);
+      display.print(F(" |M|:")); display.println(aMag, 2);
+
+      display.setCursor(0, 28);
+      display.print(F("Gz:")); display.print(gz, 1);
+      display.print(F("d/s  P:")); display.print(pitch, 1);
+      display.println(F("d"));
+
+      display.setCursor(0, 38);
+      display.print(F("Roll: ")); display.print(roll, 1); display.println(F(" deg"));
+
+      display.setCursor(0, 49);
+      display.print(F("Drive: "));
+      if (!rashBrake && !rashAccel && !rashTurn && !rashBump) {
+        display.println(F("SMOOTH"));
+      } else {
+        if (rashBrake) display.print(F("BRK "));
+        if (rashAccel) display.print(F("ACC "));
+        if (rashTurn)  display.print(F("TRN "));
+        if (rashBump)  display.print(F("BMP"));
+        display.println();
+      }
+      break;
+
+    // ── PAGE 3: SYSTEM STATUS ─────────────────────────────────────
+    case 3:
+      display.setCursor(22, 0);
+      display.println(F("=== STATUS ==="));
+
+      display.setCursor(0, 12);
+      display.print(F("WiFi:  "));
+      display.println(WiFi.status() == WL_CONNECTED ? F("Connected") : F("OFFLINE"));
+
+      display.setCursor(0, 22);
+      display.print(F("WS:    "));
+      display.println(wsConnected ? F("LIVE") : F("Offline"));
+
+      display.setCursor(0, 32);
+      display.print(F("Score: "));
+      if (serverScore >= 0) {
+        display.print(serverScore, 1); display.print(F("/10 "));
+        if      (serverBand == "green")  display.println(F("[SAFE]"));
+        else if (serverBand == "yellow") display.println(F("[WARN]"));
+        else                             display.println(F("[UNSAFE]"));
+      } else {
+        display.println(F("Waiting..."));
+      }
+
+      display.setCursor(0, 42);
+      display.print(F("Role:  ")); display.println(DEVICE_ROLE);
+
+      display.setCursor(0, 52);
+      display.print(F("Sensor: ")); display.println(OBSTACLE_SENSOR);
+      break;
+  }
+
+  display.display();
+
+  // Cycle to next page every 3 seconds
+  if (++oledTick >= 3) {
+    oledTick = 0;
+    oledPage = (oledPage + 1) % 4;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// SOCKET.IO
+// ─────────────────────────────────────────────────────────────────────
+void sendAuth() {
+  StaticJsonDocument<256> d;
+  d["token"] = JWT_TOKEN;
+  String s; serializeJson(d, s);
+  wsClient.sendTXT("40" + s);
+}
+
+void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
+
+    case WStype_DISCONNECTED:
+      wsConnected = false;
+      Serial.println("WS: Disconnected");
+      break;
+
+    case WStype_CONNECTED:
+      wsConnected = true;
+      Serial.println("WS: Connected");
+      sendAuth();
+      break;
+
+    case WStype_TEXT: {
+      String msg = String((char*)payload);
+      if (msg == "3") { wsClient.sendTXT("2"); break; } // pong
+
+      if (msg.startsWith("42")) {
+        StaticJsonDocument<512> doc;
+        deserializeJson(doc, msg.substring(2));
+        String ev = doc[0].as<String>();
+
+        if (ev == "error") {
+          Serial.println("Server: " + doc[1]["message"].as<String>());
+        }
+        if (ev == "emergencyAlertSent") {
+          Serial.println("Emergency confirmed");
+        }
+        if (ev == "safetyScore") {
+          serverScore = doc[1]["score"].as<float>();
+          serverBand  = doc[1]["band"].as<String>();
+          Serial.printf("Score: %.1f/10 [%s]\n", serverScore, serverBand.c_str());
+        }
+      }
+      break;
+    }
+
+    case WStype_ERROR:
+      Serial.println("WS: Error");
+      break;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// EMIT TELEMETRY — every 2s, driver only
+// ─────────────────────────────────────────────────────────────────────
+void emitTelemetry() {
+  if (!wsConnected || String(DEVICE_ROLE) != "driver") return;
+
+  float lat = gps.location.isValid() ? gps.location.lat() : 0.0;
+  float lng = gps.location.isValid() ? gps.location.lng() : 0.0;
+  float spd = smoothSpeed(gps.speed.isValid() ? gps.speed.kmph() : 0.0);
+  float hdg = gps.course.isValid() ? gps.course.deg() : 0.0;
+
+  StaticJsonDocument<768> doc;
+
+  doc["busId"]     = BUS_ID;
+
+  // GPS
+  doc["latitude"]   = lat;
+  doc["longitude"]  = lng;
+  doc["speed"]      = spd;
+  doc["heading"]    = hdg;
+  doc["gpsFix"]     = gps.location.isValid();
+  doc["satellites"] = gps.satellites.isValid() ? gps.satellites.value() : 0;
+  doc["hdop"]       = gps.hdop.isValid() ? gps.hdop.hdop() : 99.9;
+
+  // Obstacle
+  doc["obstacleDistance"] = obstDist;
+  doc["obstacleDetected"] = obstDetected;
+  doc["obstacleSensor"]   = OBSTACLE_SENSOR;
+
+  // DHT22
+  if (dhtValid) {
+    doc["temperature"] = cTemp;
+    doc["humidity"]    = cHum;
+    doc["heatIndex"]   = cHeatIdx;
+  } else {
+    doc["temperature"] = nullptr;
+    doc["humidity"]    = nullptr;
+    doc["heatIndex"]   = nullptr;
+  }
+  doc["dhtValid"] = dhtValid;
+
+  // MPU6050_light — m/s² and deg/s (already converted by library)
+  doc["accelX"]         = ax;
+  doc["accelY"]         = ay;
+  doc["accelZ"]         = az;
+  doc["gyroX"]          = gx;
+  doc["gyroY"]          = gy;
+  doc["gyroZ"]          = gz;
+  doc["pitch"]          = pitch;
+  doc["roll"]           = roll;
+  doc["accelMagnitude"] = aMag;
+
+  // Rash driving flags
+  doc["rashHarshBrake"] = rashBrake;
+  doc["rashHarshAccel"] = rashAccel;
+  doc["rashHarshTurn"]  = rashTurn;
+  doc["rashBump"]       = rashBump;
+
+  String data;
+  serializeJson(doc, data);
+  wsClient.sendTXT("42[\"driverLocation\"," + data + "]");
+
+  // Clear rash flags after sending
+  rashBrake = rashAccel = rashTurn = rashBump = false;
+
+  Serial.printf("TX | Spd:%.1f Obs:%.0fcm T:%.1fC Ax:%.2f Ay:%.2f Az:%.2f Gz:%.1f\n",
+    spd, obstDist,
+    dhtValid ? cTemp : 0.0,
+    ax, ay, az, gz);
+}
+
+
+
+void checkRFID() {
+  if (!rfid.PICC_IsNewCardPresent()) return;
+  if (!rfid.PICC_ReadCardSerial()) return;
+
+  String uid = "";
+
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    uid += String(rfid.uid.uidByte[i], HEX);
+  }
+
+  uid.toUpperCase();
+
+  Serial.println("RFID UID: " + uid);
+
+  // 🔥 SEND TO SERVER
+  if (wsConnected && String(CONDUCTOR_ROLE) == "conductor") {
+
+    StaticJsonDocument<256> doc;
+    doc["rfidUid"] = uid;
+    doc["busId"]   = BUS_ID;
+
+    String data;
+    serializeJson(doc, data);
+
+    // Call your backend route
+    wsClient.sendTXT("42[\"rfidCheckin\"," + data + "]");
+
+    Serial.println("RFID sent to server");
+  }
+
+  rfid.PICC_HaltA();
+}
+
+
+
+
+// ─────────────────────────────────────────────────────────────────────
+// SETUP
+// ─────────────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n╔═══════════════════════════╗");
+  Serial.println(  "║   SmartBus Node v5.2       ║");
+  Serial.println(  "║   MPU6050_light by rfetick ║");
+  Serial.println(  "╚═══════════════════════════╝");
+
+  // Obstacle sensor pins
+  if (String(OBSTACLE_SENSOR) == "ULTRASONIC") {
+    pinMode(TRIG_PIN, OUTPUT);
+    pinMode(ECHO_PIN, INPUT);
+    digitalWrite(TRIG_PIN, LOW);
+    Serial.println("Obstacle: HC-SR04  TRIG=GPIO12  ECHO=GPIO14");
+  } else {
+    pinMode(IR_PIN, INPUT);
+    Serial.println("Obstacle: IR sensor  OUT=GPIO15");
+  }
+
+  // I2C — shared by MPU6050 + OLED
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000); // 400kHz fast mode
+  Serial.println("I2C: SDA=GPIO21  SCL=GPIO22  Speed=400kHz");
+
+  // ── RFID ─────────────────────────────────────────
+  SPI.begin(18, 19, 23, 5);   // SCK, MISO, MOSI, SS
+  rfid.PCD_Init();
+
+  Serial.println("RFID: Initialized (MFRC522)");
+
+  // ── OLED ─────────────────────────────────────────────────────────
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("OLED: NOT FOUND at 0x3C — try 0x3D in OLED_ADDR");
+    oledReady = false;
+  } else {
+    oledReady = true;
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(5, 5);  display.println(F("SmartBus"));
+    display.setTextSize(1);
+    display.setCursor(20, 30); display.println(F("v5.2 Starting"));
+    display.setCursor(10, 46); display.print(F("Sensor: ")); display.println(OBSTACLE_SENSOR);
+    display.display();
+    Serial.println("OLED: Ready at 0x3C");
+  }
+
+  // ── MPU6050_light ─────────────────────────────────────────────────
+  // begin() returns 0 on success
+  byte mpuStatus = mpu.begin();
+  if (mpuStatus != 0) {
+    Serial.print("MPU6050: NOT FOUND — error code: ");
+    Serial.println(mpuStatus);
+    Serial.println("  Check: SDA=GPIO21, SCL=GPIO22, AD0=GND, VCC=3.3V");
+    mpuReady = false;
+  } else {
+    mpuReady = true;
+    Serial.println("MPU6050: Found! Calibrating — keep ESP32 STILL...");
+
+    if (oledReady) {
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setCursor(0, 20); display.println(F("MPU6050 Calibrating"));
+      display.setCursor(0, 35); display.println(F("Keep device STILL!"));
+      display.display();
+    }
+
+    // Calibrate offsets — device must be flat and still
+    mpu.calcOffsets();
+    Serial.println("MPU6050: Calibration done!");
+  }
+
+  // ── DHT22 ─────────────────────────────────────────────────────────
+  dht.begin();
+  Serial.println("DHT22: GPIO4 initialized");
+
+  if (oledReady) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 25); display.println(F("Waiting for DHT22..."));
+    display.display();
+  }
+  delay(2000); // DHT22 warmup time
+  readDHT();
+  Serial.println(dhtValid ? "DHT22: OK" : "DHT22: FAILED — check GPIO4");
+
+  // ── GPS ───────────────────────────────────────────────────────────
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  Serial.println("GPS: UART2  RX=GPIO16  TX=GPIO17");
+
+  // ── WiFi ──────────────────────────────────────────────────────────
+  if (oledReady) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 10); display.println(F("Connecting to WiFi:"));
+    display.setCursor(0, 25); display.println(WIFI_SSID);
+    display.setCursor(0, 42); display.println(F("Please wait..."));
+    display.display();
+  }
+
+  Serial.print("WiFi: Connecting to "); Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 40) {
+    delay(500); Serial.print("."); tries++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi: " + WiFi.localIP().toString());
+    if (oledReady) {
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setCursor(5, 10);  display.println(F("WiFi Connected!"));
+      display.setCursor(0, 28);  display.println(WiFi.localIP().toString());
+      display.setCursor(0, 46);  display.println(F("Connecting server..."));
+      display.display();
+      delay(1500);
+    }
+  } else {
+    Serial.println("\nWiFi: FAILED — check SSID/password");
+    if (oledReady) {
+      display.clearDisplay();
+      display.setCursor(15, 20); display.println(F("WiFi FAILED!"));
+      display.setCursor(0, 38);  display.println(F("Check credentials"));
+      display.display();
+    }
+  }
+
+  // ── WebSocket ─────────────────────────────────────────────────────
+  // wsClient.begin(SERVER_HOST, SERVER_PORT,
+  //                "/socket.io/?EIO=4&transport=websocket");
+  String url = "/socket.io/?EIO=4&transport=websocket&token=" + String(JWT_TOKEN);
+
+  wsClient.begin(SERVER_HOST, SERVER_PORT, url.c_str());
+
+
+  wsClient.onEvent(webSocketEvent);
+  wsClient.setReconnectInterval(T_RECONNECT);
+  wsClient.setExtraHeaders(
+    ("Authorization: Bearer " + String(JWT_TOKEN)).c_str());
+
+  Serial.println("\n╔═══════════ READY ═══════════╗");
+  Serial.printf( "║  Role:    %-19s║\n", DEVICE_ROLE);
+  Serial.printf( "║  Sensor:  %-19s║\n", OBSTACLE_SENSOR);
+  Serial.printf( "║  OLED:    %-19s║\n", oledReady ? "OK (0x3C)" : "NOT FOUND");
+  Serial.printf( "║  MPU6050: %-19s║\n", mpuReady  ? "OK (calibrated)" : "NOT FOUND");
+  Serial.printf( "║  DHT22:   %-19s║\n", dhtValid  ? "OK" : "CHECK GPIO4");
+  Serial.println("╚════════════════════════════╝");
+}
+
+
+
+
+
+
+// ─────────────────────────────────────────────────────────────────────
+// MAIN LOOP
+// ─────────────────────────────────────────────────────────────────────
+void loop() {
+  wsClient.loop();
+
+  // Feed GPS parser
+  while (gpsSerial.available()) gps.encode(gpsSerial.read());
+
+  unsigned long now = millis();
+
+  // MPU6050 — every 100ms (high freq for rash detection)
+  if (now - tMPU >= T_MPU) {
+    tMPU = now;
+    sampleMPU();
+  }
+
+  // DHT22 — every 3s
+  if (now - tDHT >= T_DHT) {
+    tDHT = now;
+    readDHT();
+  }
+
+  // OLED — every 1s
+  if (now - tOLED >= T_OLED) {
+    tOLED = now;
+    readObstacle();
+    updateOLED();
+  }
+
+  // Telemetry — every 2s
+  if (now - tTelemetry >= T_TELEMETRY) {
+    tTelemetry = now;
+    readObstacle();
+    emitTelemetry();
+  }
+
+  checkRFID();
+
+}
