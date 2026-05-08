@@ -13,8 +13,7 @@ const app = express();
 const server = http.createServer(app);
 
 app.use(cors({
-  origin: process.env.CORS_ORIGIN || '*',
-  credentials: true,
+  origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH']
 }));
 app.use(express.json({ limit: '10mb' }));
@@ -41,11 +40,7 @@ app.use((err, req, res, next) => {
 
 // Socket.io Setup
 const io = new Server(server, {
-  cors: { 
-    origin: process.env.CORS_ORIGIN || '*', 
-    methods: ['GET', 'POST'],
-    credentials: true
-  }
+  cors: { origin: '*', methods: ['GET', 'POST'] }
 });
 
 // Apply JWT auth middleware to all socket connections
