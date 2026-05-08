@@ -113,4 +113,143 @@ const getBusPassengers = async (req, res) => {
   }
 };
 
-module.exports = { checkInByQR, checkInByRFID, getBusPassengers };
+// POST /api/checkin/qr/checkout  [Conductor]
+// Body: { qrCode }
+const checkOutByQR = async (req, res) => {
+  try {
+    const { qrCode } = req.body;
+    if (!qrCode) return res.status(400).json({ success: false, message: 'QR code is required.' });
+
+    const booking = await Booking.findOne({
+      'passengers.qrCode': qrCode,
+      status: { $in: ['booked', 'in-progress'] }
+    }).populate('bus', 'busNumber');
+
+    if (!booking) {
+      return res.status(404).json({ success: false, message: 'No valid booking found for this QR code.' });
+    }
+
+    const passenger = booking.passengers.find((p) => p.qrCode === qrCode);
+
+    if (!passenger.checkedIn) {
+      return res.status(400).json({ success: false, message: 'Passenger is not checked in.' });
+    }
+
+    // Mark checked out
+    passenger.checkedIn = false;
+    passenger.checkedOutAt = new Date();
+
+    // Check if all passengers are checked out, then update booking status
+    const allCheckedOut = booking.passengers.every(p => !p.checkedIn);
+    if (allCheckedOut) {
+      booking.status = 'completed';
+    }
+
+    await booking.save();
+
+    res.json({
+      success: true,
+      message: `${passenger.name} (Seat ${passenger.seatNumber}) checked out successfully.`,
+      passenger,
+      bus: booking.bus
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// POST /api/checkin/rfid/checkout  [Conductor / ESP32 via secured endpoint]
+// Body: { rfidUid, busId }
+const checkOutByRFID = async (req, res) => {
+  try {
+    const { rfidUid, busId } = req.body;
+    if (!rfidUid) return res.status(400).json({ success: false, message: 'RFID UID is required.' });
+
+    const query = { 'passengers.rfidUid': rfidUid, status: { $in: ['booked', 'in-progress'] } };
+    if (busId) query.bus = busId;
+
+    const booking = await Booking.findOne(query).populate('bus', 'busNumber');
+
+    if (!booking) {
+      return res.status(404).json({ success: false, message: 'No valid booking found for this RFID UID.' });
+    }
+
+    const passenger = booking.passengers.find((p) => p.rfidUid === rfidUid);
+
+    if (!passenger.checkedIn) {
+      return res.status(400).json({ success: false, message: 'Child is not checked in.' });
+    }
+
+    passenger.checkedIn = false;
+    passenger.checkedOutAt = new Date();
+
+    const allCheckedOut = booking.passengers.every(p => !p.checkedIn);
+    if (allCheckedOut) {
+      booking.status = 'completed';
+    }
+
+    await booking.save();
+
+    res.json({
+      success: true,
+      message: `Child ${passenger.name} (Seat ${passenger.seatNumber}) checked out via RFID.`,
+      passenger,
+      bus: booking.bus
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// POST /api/checkin/passenger/checkout  [Conductor]
+// Body: { passengerId, bookingId }
+const checkOutPassenger = async (req, res) => {
+  try {
+    const { passengerId, bookingId } = req.body;
+    if (!passengerId || !bookingId) {
+      return res.status(400).json({ success: false, message: 'Passenger ID and Booking ID are required.' });
+    }
+
+    const booking = await Booking.findOne({
+      _id: bookingId,
+      status: { $in: ['booked', 'in-progress'] }
+    }).populate('bus', 'busNumber');
+
+    if (!booking) {
+      return res.status(404).json({ success: false, message: 'No valid booking found.' });
+    }
+
+    const passenger = booking.passengers.id(passengerId);
+
+    if (!passenger) {
+      return res.status(404).json({ success: false, message: 'Passenger not found in this booking.' });
+    }
+
+    if (!passenger.checkedIn) {
+      return res.status(400).json({ success: false, message: 'Passenger is not checked in.' });
+    }
+
+    // Mark checked out
+    passenger.checkedIn = false;
+    passenger.checkedOutAt = new Date();
+
+    // Check if all passengers are checked out, then update booking status
+    const allCheckedOut = booking.passengers.every(p => !p.checkedIn);
+    if (allCheckedOut) {
+      booking.status = 'completed';
+    }
+
+    await booking.save();
+
+    res.json({
+      success: true,
+      message: `${passenger.name} (Seat ${passenger.seatNumber}) checked out successfully.`,
+      passenger,
+      bus: booking.bus
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+module.exports = { checkInByQR, checkInByRFID, checkOutByQR, checkOutByRFID, getBusPassengers, checkOutPassenger };

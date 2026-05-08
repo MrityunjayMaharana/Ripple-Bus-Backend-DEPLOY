@@ -1,19 +1,3 @@
-/**
- * Safety & Comfort Score Engine v3.0
- *
- * Dimensions:
- *   Speed        25%  — GPS speed vs safe limit
- *   Obstacle     20%  — IR proximity sensor
- *   Driving      25%  — MPU6050 rash driving detection
- *   Comfort      20%  — DHT22 cabin temp + humidity
- *   GPS Quality  10%  — Fix confidence
- *
- * Score bands:
- *   >= 7.0  GREEN  "Safe & Comfortable"
- *   >= 5.0  YELLOW "Moderate Concern"
- *   <  5.0  RED    "Unsafe Conditions"
- */
-
 const WEIGHTS = {
   speed: 0.25,
   obstacle: 0.2,

@@ -125,7 +125,7 @@ const initSocket = (io) => {
         await redis.sAdd('activeBuses', busId);
 
         // Broadcast to passengers (safe data only)
-        console.log(passengerPayload)
+        // console.log(passengerPayload)
         io.to(`bus_${busId}`).emit('busLocationUpdate', passengerPayload);
         // Full data to admins
         io.to('adminRoom').emit('busTelemetry', adminPayload);
@@ -236,7 +236,7 @@ const initSocket = (io) => {
         io.to(`bus_${busId}`).emit('emergencyAlert', payload);
         socket.emit('emergencyAlertSent', { success: true, alertId: alert._id });
 
-        console.log(`🚨 Emergency from ${user.name} on bus ${busId}`);
+        console.log(`Emergency from ${user.name} on bus ${busId}`);
       } catch (err) {
         socket.emit('error', { message: 'Failed to send emergency alert.' });
       }

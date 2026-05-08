@@ -2,7 +2,8 @@ const { v4: uuidv4 } = require('uuid');
 const QRCode = require('qrcode');
 const Booking = require('../models/Booking');
 const Bus = require('../models/Bus');
-const Stop = require('../models/Stop')
+const Stop = require('../models/Stop');
+const { calculateFareBetweenStops } = require('../utils/fareCalculator');
 
 // Helper: Get occupied seats for a bus
 const getOccupiedSeats = async (busId) => {
@@ -39,15 +40,48 @@ const createBooking = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Bus is not available for booking.' });
     }
 
+    // Get source and destination stops for fare calculation
+    const sourceStopDoc = await Stop.findById(boardingStop);
+    const destinationStopDoc = await Stop.findById(destinationStop);
+    
+    if (!sourceStopDoc || !destinationStopDoc) {
+      return res.status(400).json({ success: false, message: 'Invalid source or destination stop.' });
+    }
+
+    // Calculate fare
+    const fareResult = calculateFareBetweenStops(sourceStopDoc, destinationStopDoc);
+    console.log("🔍 DEBUG: Fare calculation result:", fareResult);
+
     const occupied = await getOccupiedSeats(busId);
+
+    // Validate that provided seat numbers are available
+    const providedSeats = passengers.map(p => parseInt(p.seatNumber));
+    console.log("🔍 DEBUG: Provided seats:", providedSeats);
+    console.log("🔍 DEBUG: Occupied seats:", Array.from(occupied));
+    
+    // Check if any provided seats are already occupied
+    const conflictingSeats = providedSeats.filter(seat => occupied.has(seat));
+    if (conflictingSeats.length > 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: `Seats ${conflictingSeats.join(', ')} are already occupied.` 
+      });
+    }
+    
+    // Check if all provided seats are valid (within bus capacity)
+    const invalidSeats = providedSeats.filter(seat => seat < 1 || seat > bus.capacity);
+    if (invalidSeats.length > 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: `Seats ${invalidSeats.join(', ')} are invalid for this bus (capacity: ${bus.capacity}).` 
+      });
+    }
 
     if (occupied.size + passengers.length > bus.capacity) {
       return res.status(400).json({ success: false, message: 'Not enough seats available on this bus.' });
     }
 
-    const seats = assignSeats(passengers.length, occupied, bus.capacity);
-
-    // Build passenger details with QR/RFID
+    // Build passenger details with QR/RFID using provided seat numbers
     const passengerDetails = await Promise.all(
       passengers.map(async (p, index) => {
         const isChild = p.age < 18;
@@ -55,9 +89,11 @@ const createBooking = async (req, res) => {
           name: p.name,
           age: p.age,
           type: isChild ? 'child' : 'adult',
-          seatNumber: seats[index],
+          seatNumber: parseInt(p.seatNumber), // Use provided seat number
           checkedIn: false
         };
+        
+        console.log("🔍 DEBUG: Creating passenger detail:", detail);
 
         if (isChild) {
           // Child MUST have RFID UID provided by parent/guardian
@@ -90,6 +126,7 @@ const createBooking = async (req, res) => {
       boardingStop,
       destinationStop,
       totalSeats: passengers.length,
+      fare: fareResult.fare,
       status: 'booked'
     });
 
@@ -152,14 +189,88 @@ const getBooking = async (req, res) => {
 // GET /api/bookings/bus/:busId  [Conductor/Driver/Admin]
 const getBusBookings = async (req, res) => {
   try {
+    console.log("🔍 DEBUG: Fetching bookings for bus:", req.params.busId);
+    
     const bookings = await Booking.find({
       bus: req.params.busId,
       status: { $in: ['booked', 'in-progress'] }
-    })
-    // .populate('bookedBy', 'name email');
+    }).populate('bus', 'busNumber').populate('bookedBy', 'name email');
+
+    console.log("🔍 DEBUG: Found bookings:", bookings.length);
+    
+    bookings.forEach((booking, index) => {
+      console.log(`🔍 DEBUG: Booking ${index + 1}:`, {
+        id: booking._id,
+        status: booking.status,
+        busNumber: booking.bus?.busNumber,
+        bookedBy: booking.bookedBy?.name,
+        passengerCount: booking.passengers?.length || 0
+      });
+      
+      booking.passengers?.forEach((passenger, pIndex) => {
+        console.log(`🔍 DEBUG:   Passenger ${pIndex + 1}:`, {
+          name: passenger.name,
+          seatNumber: passenger.seatNumber,
+          checkedIn: passenger.checkedIn,
+          type: passenger.type
+        });
+      });
+    });
 
     res.json({ success: true, count: bookings.length, bookings });
   } catch (err) {
+    console.error("🔍 DEBUG: Error in getBusBookings:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+// GET /api/bookings/bus/:busId/seats  [Public - No Auth Required]
+const getSeatAvailability = async (req, res) => {
+  try {
+    console.log("🔍 DEBUG: PUBLIC - Fetching seat availability for bus:", req.params.busId);
+    
+    const bookings = await Booking.find({
+      bus: req.params.busId,
+      status: { $in: ['booked', 'in-progress'] }
+    }).select('passengers status');
+
+    console.log("🔍 DEBUG: PUBLIC - Found bookings:", bookings.length);
+    
+    // Extract occupied seats
+    const occupiedSeats = [];
+    bookings.forEach((booking, index) => {
+      console.log(`🔍 DEBUG: PUBLIC - Booking ${index + 1}:`, {
+        id: booking._id,
+        status: booking.status,
+        passengerCount: booking.passengers?.length || 0
+      });
+      
+      booking.passengers?.forEach((passenger, pIndex) => {
+        console.log(`🔍 DEBUG: PUBLIC -   Passenger ${pIndex + 1}:`, {
+          name: passenger.name,
+          seatNumber: passenger.seatNumber,
+          checkedIn: passenger.checkedIn,
+          type: passenger.type
+        });
+        
+        // Seat is occupied if booking is 'booked' OR passenger is checked in
+        if (passenger.seatNumber && (booking.status === 'booked' || passenger.checkedIn)) {
+          occupiedSeats.push(parseInt(passenger.seatNumber));
+          console.log(`🔍 DEBUG: PUBLIC - ✅ OCCUPIED seat ${passenger.seatNumber} for passenger "${passenger.name}"`);
+        }
+      });
+    });
+
+    console.log("🔍 DEBUG: PUBLIC - Final occupied seats:", occupiedSeats);
+
+    res.json({ 
+      success: true, 
+      occupiedSeats,
+      totalBookings: bookings.length,
+      busId: req.params.busId
+    });
+  } catch (err) {
+    console.error("🔍 DEBUG: PUBLIC - Error in getSeatAvailability:", err);
     res.status(500).json({ success: false, message: err.message });
   }
 };
@@ -208,4 +319,4 @@ const getAllBookings = async (req, res) => {
   }
 };
 
-module.exports = { createBooking, getMyBookings, getBooking, getBusBookings, cancelBooking, getAllBookings };
+module.exports = { createBooking, getMyBookings, getBooking, getBusBookings, cancelBooking, getAllBookings, getSeatAvailability };

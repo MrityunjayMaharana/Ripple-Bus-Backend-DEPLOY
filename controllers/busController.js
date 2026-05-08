@@ -52,9 +52,15 @@ const getLiveLocation = async (req, res) => {
 // GET /api/buses/active
 const getActiveBuses = async (req, res) => {
   try {
-    const redis = getRedis();
-    const activeBusIds = await redis.sMembers('activeBuses');
-    res.json({ success: true, count: activeBusIds.length, activeBusIds });
+    // For public tracking, return buses that are active or en-route
+    const buses = await Bus.find({ 
+      status: { $in: ['active', 'en-route'] }
+    })
+      .populate('driver', 'name email phone')
+      .populate('conductor', 'name email phone')
+      .populate('route', 'name latitude longitude');
+    
+    res.json({ success: true, count: buses.length, buses });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
